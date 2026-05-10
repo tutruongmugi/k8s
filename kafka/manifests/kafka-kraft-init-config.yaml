@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-kraft-init-config
+  namespace: kafka
+data:
+  kraft-init.properties: |
+    process.roles=broker,controller
+    node.id=0
+    log.dirs=/kafka/data
+    controller.listener.names=CONTROLLER
+    inter.broker.listener.name=INSIDE
+    listener.security.protocol.map=INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT,CONTROLLER:PLAINTEXT
+    listeners=INSIDE://:9092,OUTSIDE://:9094,CONTROLLER://:9093
+    controller.quorum.voters=10@kafka-0.kafka.kafka.svc.cluster.local:9093

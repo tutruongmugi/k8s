@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: kafka
+spec:
+  serviceName: "kafka"
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      terminationGracePeriodSeconds: 30
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - kafka
+              topologyKey: "kubernetes.io/hostname"
+      initContainers:
+        - name: kafka-init
+          image: apache/kafka:4.0.0
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              export KAFKA_NODE_ID=$(( ORDINAL * 10 + 10 ))
+              
+              if [ ! -f /kafka/data/meta.properties ]; then
+                echo "Formatting KRaft storage for node $KAFKA_NODE_ID..."
+                cp /tmp/kraft-init.properties /tmp/kraft-init-dynamic.properties
+                sed -i "s/node.id=0/node.id=${KAFKA_NODE_ID}/g" /tmp/kraft-init-dynamic.properties
+                
+                /opt/kafka/bin/kafka-storage.sh format \
+                  --config /tmp/kraft-init-dynamic.properties \
+                  --cluster-id ${CLUSTER_ID} \
+                  --ignore-formatted
+              else
+                echo "Storage already formatted, skipping."
+              fi
+          env:
+            - name: CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-cluster-id
+                  key: CLUSTER_ID
+          volumeMounts:
+            - name: data
+              mountPath: /kafka/data
+            - name: kafka-init-config
+              mountPath: /tmp/kraft-init.properties
+              subPath: kraft-init.properties
+      containers:
+        - name: kafka
+          image: apache/kafka:4.0.0
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              export KAFKA_NODE_ID=$(( ORDINAL * 10 + 10 ))
+              exec /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/kraft/server.properties \
+                --override node.id=$KAFKA_NODE_ID \
+                --override controller.quorum.voters=$KAFKA_CONTROLLER_QUORUM_VOTERS \
+                --override listeners=$KAFKA_LISTENERS \
+                --override advertised.listeners=$KAFKA_ADVERTISED_LISTENERS
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-cluster-id
+                  key: CLUSTER_ID
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "INSIDE://$(POD_NAME).kafka.kafka.svc.cluster.local:9092,OUTSIDE://$(NODE_IP):30094"
+            - name: KAFKA_LISTENERS
+              value: "INSIDE://:9092,OUTSIDE://:9094,CONTROLLER://:9093"
+            - name: JMX_PORT
+              value: "1099"
+            - name: KAFKA_JMX_OPTS
+              value: >-
+                -Dcom.sun.management.jmxremote
+                -Dcom.sun.management.jmxremote.authenticate=false
+                -Dcom.sun.management.jmxremote.ssl=false
+                -Djava.rmi.server.hostname=127.0.0.1
+                -Dcom.sun.management.jmxremote.rmi.port=$(JMX_PORT)
+          envFrom:
+            - configMapRef:
+                name: kafka-configmap
+          ports:
+            - name: broker-inside
+              containerPort: 9092
+            - name: broker-outside
+              containerPort: 9094
+            - name: controller
+              containerPort: 9093
+            - name: jmx
+              containerPort: 1099
+          resources:
+            requests:
+              memory: "4000Mi"
+              cpu: "1000m"
+            limits:
+              memory: "15000Mi"
+              cpu: "2000m"
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /kafka/data
+            - name: kafka-server-config
+              mountPath: /opt/kafka/config/kraft/server.properties
+              subPath: server.properties
+      volumes:
+        - name: kafka-init-config
+          configMap:
+            name: kafka-kraft-init-config
+        - name: kafka-server-config
+          configMap:
+            name: kafka-kraft-server-config
+      restartPolicy: Always
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 101Gi
